@@ -624,9 +624,24 @@ async fn submit_candidate(
     }
     let pointer = target_root.join("current");
     let pointer_tmp = target_root.join(format!(".current-{}", ticket.operation_id));
-    if fs::write(&pointer_tmp, format!("{manifest_id}\n"))
-        .await
-        .is_err()
+    let Ok(promoted_at_unix) = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+    else {
+        let _ = fs::remove_dir_all(&snapshot).await;
+        return unavailable();
+    };
+    let current_pointer = CurrentPointer {
+        schema_version: 1,
+        manifest_id: manifest_id.clone(),
+        operation_id: ticket.operation_id.clone(),
+        promoted_at_unix,
+    };
+    let Ok(pointer_bytes) = serde_json::to_vec(&current_pointer) else {
+        let _ = fs::remove_dir_all(&snapshot).await;
+        return unavailable();
+    };
+    if fs::write(&pointer_tmp, pointer_bytes).await.is_err()
         || fs::rename(&pointer_tmp, &pointer).await.is_err()
     {
         let _ = fs::remove_file(&pointer_tmp).await;
@@ -647,6 +662,16 @@ struct CurrentSnapshot {
     manifest_bytes: Vec<u8>,
     signature: String,
     archive_path: PathBuf,
+    promotion: CurrentPointer,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentPointer {
+    schema_version: u32,
+    manifest_id: String,
+    operation_id: String,
+    promoted_at_unix: u64,
 }
 
 async fn current_snapshot(
@@ -660,14 +685,21 @@ async fn current_snapshot(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if fs::metadata(&pointer).await?.len() > 65 {
+    if fs::metadata(&pointer).await?.len() > 512 {
         return Ok(None);
     }
-    let id = fs::read_to_string(pointer).await?;
-    let id = id.trim();
-    if !valid_digest(id) {
+    let pointer_bytes = fs::read(pointer).await?;
+    let Ok(promotion) = serde_json::from_slice::<CurrentPointer>(&pointer_bytes) else {
+        return Ok(None);
+    };
+    if promotion.schema_version != 1
+        || !valid_digest(&promotion.manifest_id)
+        || !valid_operation_id(&promotion.operation_id)
+        || promotion.promoted_at_unix == 0
+    {
         return Ok(None);
     }
+    let id = promotion.manifest_id.as_str();
     let snapshot = target_root.join("snapshots").join(id);
     let manifest_path =
         match existing_file_under_root(&config.root, &snapshot.join("manifest.json")).await {
@@ -715,6 +747,7 @@ async fn current_snapshot(
         manifest_bytes,
         signature,
         archive_path,
+        promotion,
     }))
 }
 
@@ -866,7 +899,7 @@ fn valid_digest(value: &str) -> bool {
 }
 
 fn valid_service_token(value: &str) -> bool {
-    valid_digest(value)
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn valid_operation_id(value: &str) -> bool {
@@ -1040,6 +1073,7 @@ mod tests {
     fn protocol_digests_and_signatures_require_canonical_lowercase_hex() {
         assert!(valid_digest(&"a".repeat(64)));
         assert!(!valid_digest(&"A".repeat(64)));
+        assert!(valid_service_token(&"A".repeat(64)));
         assert!(decode_hex::<2>("00ff").is_some());
         assert!(decode_hex::<2>("00FF").is_none());
     }

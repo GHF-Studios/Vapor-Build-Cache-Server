@@ -209,6 +209,15 @@ async fn signed_candidate_promotes_and_serves_matching_snapshot() {
         .await
         .unwrap();
     assert_eq!(candidate_response.status(), StatusCode::CREATED);
+    let current_pointer: Value = serde_json::from_slice(
+        &tokio::fs::read(root.join("targets/x86_64-unknown-linux-gnu/current"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(current_pointer["schema_version"], 1);
+    assert_eq!(current_pointer["operation_id"], operation);
+    assert!(current_pointer["promoted_at_unix"].as_u64().unwrap() > 0);
 
     let manifest_response = app
         .clone()

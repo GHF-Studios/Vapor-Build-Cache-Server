@@ -30,8 +30,10 @@ The VPS orchestrator requests a short-lived, one-use ticket for one supported
 target and operation ID. Candidate uploads carry a signed manifest and stream
 the archive to staging. The service verifies the current lock/environment
 identity, Ed25519 signature, exact archive size and SHA-256 before atomically
-switching the target's current pointer. A rejected candidate leaves the prior
-pointer unchanged.
+switching the target's current pointer. The atomic pointer includes the
+operation ID and promotion time, so the admin inventory can identify the last
+successful promotion without a separate, potentially inconsistent audit file.
+A rejected candidate leaves the prior pointer unchanged.
 
 ## Configuration
 

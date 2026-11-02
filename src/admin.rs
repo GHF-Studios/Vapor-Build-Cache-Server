@@ -177,9 +177,17 @@ async fn page(State(config): State<BuildCacheConfig>, headers: HeaderMap) -> Res
             .as_ref()
             .map(|item| item.manifest.archive_size.to_string())
             .unwrap_or_else(|| "—".to_owned());
-        rows.push_str(&format!("<tr><td><code>{}</code></td><td>{state}</td><td>{}</td><td><code>{}</code></td><td>{size}</td></tr>", escape_html(target), escape_html(version), escape_html(digest)));
+        let promotion = snapshot
+            .as_ref()
+            .map(|item| item.promotion.operation_id.as_str())
+            .unwrap_or("—");
+        let promoted_at = snapshot
+            .as_ref()
+            .map(|item| item.promotion.promoted_at_unix.to_string())
+            .unwrap_or_else(|| "—".to_owned());
+        rows.push_str(&format!("<tr><td><code>{}</code></td><td>{state}</td><td>{}</td><td><code>{}</code></td><td>{size}</td><td><code>{}</code></td><td>{promoted_at}</td></tr>", escape_html(target), escape_html(version), escape_html(digest), escape_html(promotion)));
     }
-    let html = format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Build Cache · Vapor Admin</title><link rel=\"stylesheet\" href=\"/admin/assets/admin.css\"><script defer src=\"/admin/assets/admin.js\"></script></head><body><main id=\"admin-content\"><p class=\"eyebrow\">Build Cache · Snapshot service</p><h1>Target snapshots</h1><p class=\"muted\">Read-only current snapshot state. Promotion is controlled by the VPS builder flow.</p><div class=\"card\"><table><thead><tr><th>Rust target</th><th>State</th><th>Vapor version</th><th>Archive SHA-256</th><th>Bytes</th></tr></thead><tbody>{rows}</tbody></table><p class=\"muted\">Only the exact current client and lock state is accepted. Snapshot bytes are compiler output only.</p></div></main></body></html>");
+    let html = format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Build Cache · Vapor Admin</title><link rel=\"stylesheet\" href=\"/admin/assets/admin.css\"><script defer src=\"/admin/assets/admin.js\"></script></head><body><main id=\"admin-content\"><p class=\"eyebrow\">Build Cache · Snapshot service</p><h1>Target snapshots</h1><p class=\"muted\">Read-only current snapshot state. Promotion is controlled by the VPS builder flow.</p><div class=\"card\"><table><thead><tr><th>Rust target</th><th>State</th><th>Vapor version</th><th>Archive SHA-256</th><th>Bytes</th><th>Last promotion</th><th>Promoted (Unix)</th></tr></thead><tbody>{rows}</tbody></table><p class=\"muted\">Only the exact current client and lock state is accepted. Snapshot bytes are compiler output only.</p></div></main></body></html>");
     private_response(StatusCode::OK, &html)
 }
 
