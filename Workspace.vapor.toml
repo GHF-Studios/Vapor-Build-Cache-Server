@@ -1,0 +1,16 @@
+schema = 1
+
+[workspace]
+name = "vapor-build-cache-server"
+organization = "ghf-studios"
+version = "0.1.0"
+repository = "https://github.com/GHF-Studios/Vapor-Build-Cache-Server"
+
+[toolchain]
+channel = "stable"
+version = "1.97.0"
+date = "2026-07-09"
+
+[[project]]
+name = "vapor-build-cache-server"
+path = "."
