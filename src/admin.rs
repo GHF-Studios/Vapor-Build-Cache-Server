@@ -185,9 +185,11 @@ async fn page(State(config): State<BuildCacheConfig>, headers: HeaderMap) -> Res
             .as_ref()
             .map(|item| item.promotion.promoted_at_unix.to_string())
             .unwrap_or_else(|| "—".to_owned());
-        rows.push_str(&format!("<tr><td><code>{}</code></td><td>{state}</td><td>{}</td><td><code>{}</code></td><td>{size}</td><td><code>{}</code></td><td>{promoted_at}</td></tr>", escape_html(target), escape_html(version), escape_html(digest), escape_html(promotion)));
+        let vapor_lock = config.vapor_lock_sha256.as_deref().unwrap_or("—");
+        let toolchain_lock = config.toolchain_lock_sha256.as_deref().unwrap_or("—");
+        rows.push_str(&format!("<tr><td><code>{}</code></td><td>{state}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{size}</td><td><code>{}</code></td><td>{promoted_at}</td></tr>", escape_html(target), escape_html(version), escape_html(vapor_lock), escape_html(toolchain_lock), escape_html(digest), escape_html(promotion)));
     }
-    let html = format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Build Cache · Vapor Admin</title><link rel=\"stylesheet\" href=\"/admin/assets/admin.css\"><script defer src=\"/admin/assets/admin.js\"></script></head><body><main id=\"admin-content\"><p class=\"eyebrow\">Build Cache · Snapshot service</p><h1>Target snapshots</h1><p class=\"muted\">Read-only current snapshot state. Promotion is controlled by the VPS builder flow.</p><div class=\"card\"><table><thead><tr><th>Rust target</th><th>State</th><th>Vapor version</th><th>Archive SHA-256</th><th>Bytes</th><th>Last promotion</th><th>Promoted (Unix)</th></tr></thead><tbody>{rows}</tbody></table><p class=\"muted\">Only the exact current client and lock state is accepted. Snapshot bytes are compiler output only.</p></div></main></body></html>");
+    let html = format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Build Cache · Vapor Admin</title><link rel=\"stylesheet\" href=\"/admin/assets/admin.css\"><script defer src=\"/admin/assets/admin.js\"></script></head><body><main id=\"admin-content\"><p class=\"eyebrow\">Build Cache · Snapshot service</p><h1>Target snapshots</h1><p class=\"muted\">Read-only current snapshot state. Promotion is controlled by the VPS builder flow.</p><div class=\"card\"><table><thead><tr><th>Rust target</th><th>State</th><th>Vapor version</th><th>Vapor.lock SHA-256</th><th>Toolchain lock SHA-256</th><th>Archive SHA-256</th><th>Bytes</th><th>Last promotion</th><th>Promoted (Unix)</th></tr></thead><tbody>{rows}</tbody></table><p class=\"muted\">Only the exact current client and lock state is accepted. Snapshot bytes are compiler output only.</p></div></main></body></html>");
     private_response(StatusCode::OK, &html)
 }
 
@@ -227,4 +229,82 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{router as admin_router, AuthorizationClient};
+    use crate::BuildCacheConfig;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn build_cache_admin_shows_target_locks_and_latest_promotion_columns() {
+        let auth_app = Router::new().route(
+            "/",
+            post(|| async {
+                Json(json!({
+                    "allowed": true,
+                    "expires_at_unix": i64::MAX
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let auth_server = tokio::spawn(async move {
+            axum::serve(listener, auth_app).await.unwrap();
+        });
+
+        let vapor_lock = "a".repeat(64);
+        let toolchain_lock = "b".repeat(64);
+        let mut config = BuildCacheConfig::new(
+            std::env::temp_dir().join(format!("vapor-admin-test-{}", std::process::id())),
+            "0.5.0".to_owned(),
+            vapor_lock.clone(),
+            toolchain_lock.clone(),
+            "test-recipe".to_owned(),
+            "test-key".to_owned(),
+            [1_u8; 32],
+            HashMap::from([
+                ("x86_64-unknown-linux-gnu".to_owned(), "c".repeat(64)),
+                ("x86_64-pc-windows-gnullvm".to_owned(), "d".repeat(64)),
+            ]),
+            "e".repeat(64),
+        );
+        config.admin_authorization = Some(AuthorizationClient {
+            endpoint: reqwest::Url::parse(&endpoint).unwrap(),
+            token: "f".repeat(64),
+            http: reqwest::Client::new(),
+        });
+
+        let app = admin_router(config);
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/admin/build-cache")
+                    .header(
+                        "cookie",
+                        "vapor_identity_session=abcdefghijklmnopqrstuvwxyz123456",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "private, no-store");
+        let html = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(html.to_vec()).unwrap();
+        assert!(html.contains("x86_64-unknown-linux-gnu"));
+        assert!(html.contains("x86_64-pc-windows-gnullvm"));
+        assert!(html.contains(&vapor_lock));
+        assert!(html.contains(&toolchain_lock));
+        assert!(html.contains("Last promotion"));
+        assert!(html.contains("Promoted (Unix)"));
+        auth_server.abort();
+    }
 }
