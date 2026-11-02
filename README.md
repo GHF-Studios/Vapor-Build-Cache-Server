@@ -22,9 +22,9 @@ When composed, public routes live under `/api/build-cache/`:
 - `GET /v1/targets/{target}/current/snapshot.tar.zst` streams the matching
   archive after the same checks.
 - `GET /admin/build-cache` is a root-authorized read-only target inventory.
-- Internal operation and candidate routes are blocked by Caddy in
-  independent-service mode and require the private VPS orchestrator token in
-  either mode.
+- Internal operation and candidate routes are blocked by both Caddy templates
+  and also require the private VPS orchestrator token when reached over the
+  loopback interface.
 
 The VPS orchestrator requests a short-lived, one-use ticket for one supported
 target and operation ID. Candidate uploads carry a signed manifest and stream
