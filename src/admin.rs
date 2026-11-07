@@ -153,41 +153,54 @@ async fn page(State(config): State<BuildCacheConfig>, headers: HeaderMap) -> Res
     }
     let mut rows = String::new();
     for target in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnullvm"] {
-        let snapshot = super::current_snapshot(&config, target)
-            .await
-            .ok()
-            .flatten();
         let configured = config.ready_for_target(target);
-        let state = if !configured {
-            "Unavailable: target lock/signing config missing"
-        } else if snapshot.is_some() {
-            "Current"
+        let (state, version, digest, size, promotion, promoted_at) = if !configured {
+            (
+                "Unavailable: target lock/signing config missing",
+                "—".to_owned(),
+                "—".to_owned(),
+                "—".to_owned(),
+                "—".to_owned(),
+                "—".to_owned(),
+            )
         } else {
-            "No current snapshot"
+            match super::current_snapshot_state(&config, target)
+                .await
+                .ok()
+                .flatten()
+            {
+                Some(super::CurrentSnapshotState::Current(snapshot)) => (
+                    "Current",
+                    snapshot.manifest.vapor_version,
+                    snapshot.manifest.archive_sha256,
+                    snapshot.manifest.archive_size.to_string(),
+                    snapshot.promotion.operation_id,
+                    snapshot.promotion.promoted_at_unix.to_string(),
+                ),
+                Some(super::CurrentSnapshotState::Stale {
+                    manifest,
+                    promotion,
+                }) => (
+                    "Stale (snapshot identity differs from current configuration)",
+                    manifest.vapor_version,
+                    manifest.archive_sha256,
+                    manifest.archive_size.to_string(),
+                    promotion.operation_id,
+                    promotion.promoted_at_unix.to_string(),
+                ),
+                None => (
+                    "No current snapshot",
+                    "—".to_owned(),
+                    "—".to_owned(),
+                    "—".to_owned(),
+                    "—".to_owned(),
+                    "—".to_owned(),
+                ),
+            }
         };
-        let version = snapshot
-            .as_ref()
-            .map(|item| item.manifest.vapor_version.as_str())
-            .unwrap_or("—");
-        let digest = snapshot
-            .as_ref()
-            .map(|item| item.manifest.archive_sha256.as_str())
-            .unwrap_or("—");
-        let size = snapshot
-            .as_ref()
-            .map(|item| item.manifest.archive_size.to_string())
-            .unwrap_or_else(|| "—".to_owned());
-        let promotion = snapshot
-            .as_ref()
-            .map(|item| item.promotion.operation_id.as_str())
-            .unwrap_or("—");
-        let promoted_at = snapshot
-            .as_ref()
-            .map(|item| item.promotion.promoted_at_unix.to_string())
-            .unwrap_or_else(|| "—".to_owned());
         let vapor_lock = config.vapor_lock_sha256.as_deref().unwrap_or("—");
         let toolchain_lock = config.toolchain_lock_sha256.as_deref().unwrap_or("—");
-        rows.push_str(&format!("<tr><td><code>{}</code></td><td>{state}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{size}</td><td><code>{}</code></td><td>{promoted_at}</td></tr>", escape_html(target), escape_html(version), escape_html(vapor_lock), escape_html(toolchain_lock), escape_html(digest), escape_html(promotion)));
+        rows.push_str(&format!("<tr><td><code>{}</code></td><td>{state}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td><code>{}</code></td><td>{}</td></tr>", escape_html(target), escape_html(&version), escape_html(vapor_lock), escape_html(toolchain_lock), escape_html(&digest), escape_html(&size), escape_html(&promotion), escape_html(&promoted_at)));
     }
     let html = format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Build Cache · Vapor Admin</title><link rel=\"stylesheet\" href=\"/admin/assets/admin.css\"><script defer src=\"/admin/assets/admin.js\"></script></head><body><main id=\"admin-content\"><p class=\"eyebrow\">Build Cache · Snapshot service</p><h1>Target snapshots</h1><p class=\"muted\">Read-only current snapshot state. Promotion is controlled by the VPS builder flow.</p><div class=\"card\"><table><thead><tr><th>Rust target</th><th>State</th><th>Vapor version</th><th>Vapor.lock SHA-256</th><th>Toolchain lock SHA-256</th><th>Archive SHA-256</th><th>Bytes</th><th>Last promotion</th><th>Promoted (Unix)</th></tr></thead><tbody>{rows}</tbody></table><p class=\"muted\">Only the exact current client and lock state is accepted. Snapshot bytes are compiler output only.</p></div></main></body></html>");
     private_response(StatusCode::OK, &html)
@@ -237,8 +250,10 @@ mod tests {
     use crate::BuildCacheConfig;
     use axum::routing::post;
     use axum::{Json, Router};
+    use ring::signature::KeyPair;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -306,5 +321,186 @@ mod tests {
         assert!(html.contains("Last promotion"));
         assert!(html.contains("Promoted (Unix)"));
         auth_server.abort();
+    }
+
+    #[tokio::test]
+    async fn build_cache_admin_marks_snapshot_stale_when_vapor_lock_changes() {
+        let auth_app = Router::new().route(
+            "/",
+            post(|| async {
+                Json(json!({
+                    "allowed": true,
+                    "expires_at_unix": i64::MAX
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let auth_server = tokio::spawn(async move {
+            axum::serve(listener, auth_app).await.unwrap();
+        });
+
+        let key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[0x42; 32]).unwrap();
+        let mut public_key = [0_u8; 32];
+        public_key.copy_from_slice(key.public_key().as_ref());
+        let old_vapor_lock = "a".repeat(64);
+        let toolchain_lock = "b".repeat(64);
+        let root = std::env::temp_dir().join(format!(
+            "vapor-stale-admin-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = BuildCacheConfig::new(
+            root.clone(),
+            "0.5.0".to_owned(),
+            "c".repeat(64),
+            toolchain_lock,
+            "test-recipe".to_owned(),
+            "test-key".to_owned(),
+            public_key,
+            HashMap::from([
+                ("x86_64-unknown-linux-gnu".to_owned(), "d".repeat(64)),
+                ("x86_64-pc-windows-gnullvm".to_owned(), "e".repeat(64)),
+            ]),
+            "f".repeat(64),
+        );
+        let archive = b"signed compiler snapshot";
+        let manifest = crate::BuildSnapshotManifest {
+            schema_version: 1,
+            key_id: "test-key".to_owned(),
+            vapor_version: "0.5.0".to_owned(),
+            vapor_lock_sha256: old_vapor_lock.clone(),
+            toolchain_lock_sha256: "b".repeat(64),
+            target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+            build_recipe_id: "test-recipe".to_owned(),
+            builder_environment_digest: "d".repeat(64),
+            archive_sha256: crate::digest_hex(archive),
+            archive_size: archive.len() as u64,
+            created_at_utc: "2026-11-07T00:00:00Z".to_owned(),
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let manifest_id = crate::digest_hex(&manifest_bytes);
+        let signature = crate::encode_hex(key.sign(&manifest_bytes).as_ref());
+        let snapshot_dir = root
+            .join("targets/x86_64-unknown-linux-gnu/snapshots")
+            .join(&manifest_id);
+        tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
+        tokio::fs::write(snapshot_dir.join("manifest.json"), &manifest_bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(snapshot_dir.join("manifest.json.sig"), signature)
+            .await
+            .unwrap();
+        tokio::fs::write(snapshot_dir.join("snapshot.tar.zst"), archive)
+            .await
+            .unwrap();
+        let pointer = crate::CurrentPointer {
+            schema_version: 1,
+            manifest_id,
+            operation_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            promoted_at_unix: 1_762_478_400,
+        };
+        tokio::fs::write(
+            root.join("targets/x86_64-unknown-linux-gnu/current"),
+            serde_json::to_vec(&pointer).unwrap(),
+        )
+        .await
+        .unwrap();
+        config.admin_authorization = Some(AuthorizationClient {
+            endpoint: reqwest::Url::parse(&endpoint).unwrap(),
+            token: "f".repeat(64),
+            http: reqwest::Client::new(),
+        });
+        let client_config = config.clone();
+
+        let response = admin_router(config)
+            .oneshot(
+                axum::http::Request::get("/admin/build-cache")
+                    .header(
+                        "cookie",
+                        "vapor_identity_session=abcdefghijklmnopqrstuvwxyz123456",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let html = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(html.to_vec()).unwrap();
+        assert!(html.contains("Stale (snapshot identity differs from current configuration)"));
+        assert!(!html.contains("<td>Current</td>"));
+        let response = crate::api_router(client_config.clone())
+            .oneshot(
+                axum::http::Request::get(
+                    "/v1/targets/x86_64-unknown-linux-gnu/current/manifest.json",
+                )
+                .header("x-vapor-client-version", "0.5.0")
+                .header("x-vapor-lock-sha256", "c".repeat(64))
+                .header("x-vapor-toolchain-lock-sha256", "b".repeat(64))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+
+        let mut matching_config = client_config.clone();
+        matching_config.vapor_lock_sha256 = Some(old_vapor_lock);
+        let response = admin_router(matching_config)
+            .oneshot(
+                axum::http::Request::get("/admin/build-cache")
+                    .header(
+                        "cookie",
+                        "vapor_identity_session=abcdefghijklmnopqrstuvwxyz123456",
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let html = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(html.to_vec())
+            .unwrap()
+            .contains("<td>Current</td>"));
+        auth_server.abort();
+        tokio::fs::remove_dir_all(root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn build_cache_admin_exposes_no_browser_mutation_route() {
+        let config = BuildCacheConfig::new(
+            std::env::temp_dir().join(format!("vapor-admin-method-test-{}", std::process::id())),
+            "0.5.0".to_owned(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "test-recipe".to_owned(),
+            "test-key".to_owned(),
+            [1_u8; 32],
+            HashMap::from([
+                ("x86_64-unknown-linux-gnu".to_owned(), "c".repeat(64)),
+                ("x86_64-pc-windows-gnullvm".to_owned(), "d".repeat(64)),
+            ]),
+            "e".repeat(64),
+        );
+        let response = admin_router(config)
+            .oneshot(
+                axum::http::Request::post("/admin/build-cache")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::METHOD_NOT_ALLOWED
+        );
     }
 }

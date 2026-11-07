@@ -678,6 +678,24 @@ async fn current_snapshot(
     config: &BuildCacheConfig,
     target: &str,
 ) -> std::io::Result<Option<CurrentSnapshot>> {
+    match current_snapshot_state(config, target).await? {
+        Some(CurrentSnapshotState::Current(snapshot)) => Ok(Some(snapshot)),
+        Some(CurrentSnapshotState::Stale { .. }) | None => Ok(None),
+    }
+}
+
+enum CurrentSnapshotState {
+    Current(CurrentSnapshot),
+    Stale {
+        manifest: BuildSnapshotManifest,
+        promotion: CurrentPointer,
+    },
+}
+
+async fn current_snapshot_state(
+    config: &BuildCacheConfig,
+    target: &str,
+) -> std::io::Result<Option<CurrentSnapshotState>> {
     let target_root = config.root.join("targets").join(target);
     let pointer = target_root.join("current");
     let pointer = match existing_file_under_root(&config.root, &pointer).await {
@@ -716,7 +734,7 @@ async fn current_snapshot(
     let Ok(manifest) = serde_json::from_slice::<BuildSnapshotManifest>(&manifest_bytes) else {
         return Ok(None);
     };
-    if !manifest_matches(config, target, &manifest) {
+    if !manifest_structure_valid(config, target, &manifest) {
         return Ok(None);
     }
     let signature_path =
@@ -742,13 +760,38 @@ async fn current_snapshot(
     if fs::metadata(&archive_path).await?.len() != manifest.archive_size {
         return Ok(None);
     }
-    Ok(Some(CurrentSnapshot {
+    if !manifest_matches(config, target, &manifest) {
+        return Ok(Some(CurrentSnapshotState::Stale {
+            manifest,
+            promotion,
+        }));
+    }
+    Ok(Some(CurrentSnapshotState::Current(CurrentSnapshot {
         manifest,
         manifest_bytes,
         signature,
         archive_path,
         promotion,
-    }))
+    })))
+}
+
+fn manifest_structure_valid(
+    config: &BuildCacheConfig,
+    target: &str,
+    manifest: &BuildSnapshotManifest,
+) -> bool {
+    manifest.schema_version == 1
+        && manifest.key_id == config.key_id.as_deref().unwrap_or_default()
+        && manifest.target_triple == target
+        && valid_version(&manifest.vapor_version)
+        && valid_digest(&manifest.vapor_lock_sha256)
+        && valid_digest(&manifest.toolchain_lock_sha256)
+        && valid_segment(&manifest.build_recipe_id)
+        && valid_digest(&manifest.builder_environment_digest)
+        && valid_digest(&manifest.archive_sha256)
+        && manifest.archive_size > 0
+        && manifest.archive_size <= config.max_archive_bytes
+        && valid_utc_timestamp(&manifest.created_at_utc)
 }
 
 fn manifest_matches(
@@ -756,22 +799,16 @@ fn manifest_matches(
     target: &str,
     manifest: &BuildSnapshotManifest,
 ) -> bool {
-    manifest.schema_version == 1
-        && manifest.key_id == config.key_id.as_deref().unwrap_or_default()
+    manifest_structure_valid(config, target, manifest)
         && manifest.vapor_version == config.client_version.as_deref().unwrap_or_default()
         && manifest.vapor_lock_sha256 == config.vapor_lock_sha256.as_deref().unwrap_or_default()
         && manifest.toolchain_lock_sha256
             == config.toolchain_lock_sha256.as_deref().unwrap_or_default()
-        && manifest.target_triple == target
         && manifest.build_recipe_id == config.build_recipe_id.as_deref().unwrap_or_default()
         && config
             .builder_environment
             .get(target)
             .is_some_and(|value| value == &manifest.builder_environment_digest)
-        && valid_digest(&manifest.archive_sha256)
-        && manifest.archive_size > 0
-        && manifest.archive_size <= config.max_archive_bytes
-        && valid_utc_timestamp(&manifest.created_at_utc)
 }
 
 fn verify_signature(
