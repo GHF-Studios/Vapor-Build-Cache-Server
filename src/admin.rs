@@ -202,7 +202,7 @@ async fn page(State(config): State<BuildCacheConfig>, headers: HeaderMap) -> Res
         let toolchain_lock = config.toolchain_lock_sha256.as_deref().unwrap_or("—");
         rows.push_str(&format!("<tr><td><code>{}</code></td><td>{state}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td><code>{}</code></td><td>{}</td></tr>", escape_html(target), escape_html(&version), escape_html(vapor_lock), escape_html(toolchain_lock), escape_html(&digest), escape_html(&size), escape_html(&promotion), escape_html(&promoted_at)));
     }
-    let html = format!("<p class=\"eyebrow\">Build Cache · Snapshot service</p><h1>Target snapshots</h1><p class=\"muted\">Read-only current snapshot state. Promotion is controlled by the VPS builder flow.</p><div class=\"card\"><table><thead><tr><th>Rust target</th><th>State</th><th>Vapor version</th><th>Vapor.lock SHA-256</th><th>Toolchain lock SHA-256</th><th>Archive SHA-256</th><th>Bytes</th><th>Last promotion</th><th>Promoted (Unix)</th></tr></thead><tbody>{rows}</tbody></table><p class=\"muted\">Only the exact current client and lock state is accepted. Snapshot bytes are compiler output only.</p></div>");
+    let html = format!("<p class=\"eyebrow\">Build Cache · Snapshot service</p><h1>Target snapshots</h1><p class=\"muted\">Read-only current snapshot state. Promotion is controlled by the VPS builder flow.</p><div class=\"card\"><div class=\"table-scroll\" role=\"region\" tabindex=\"0\" aria-label=\"Target snapshot table\"><table><thead><tr><th>Rust target</th><th>State</th><th>Vapor version</th><th>Vapor.lock SHA-256</th><th>Toolchain lock SHA-256</th><th>Archive SHA-256</th><th>Bytes</th><th>Last promotion</th><th>Promoted (Unix)</th></tr></thead><tbody>{rows}</tbody></table></div><p class=\"muted\">Only the exact current client and lock state is accepted. Snapshot bytes are compiler output only.</p></div>");
     private_response(StatusCode::OK, &html)
 }
 
@@ -327,6 +327,7 @@ mod tests {
         assert!(html.contains(&toolchain_lock));
         assert!(html.contains("Last promotion"));
         assert!(html.contains("Promoted (Unix)"));
+        assert!(html.contains("aria-label=\"Target snapshot table\""));
         auth_server.abort();
     }
 
