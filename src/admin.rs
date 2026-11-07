@@ -202,7 +202,7 @@ async fn page(State(config): State<BuildCacheConfig>, headers: HeaderMap) -> Res
         let toolchain_lock = config.toolchain_lock_sha256.as_deref().unwrap_or("—");
         rows.push_str(&format!("<tr><td><code>{}</code></td><td>{state}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td><code>{}</code></td><td>{}</td></tr>", escape_html(target), escape_html(&version), escape_html(vapor_lock), escape_html(toolchain_lock), escape_html(&digest), escape_html(&size), escape_html(&promotion), escape_html(&promoted_at)));
     }
-    let html = format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Build Cache · Vapor Admin</title><link rel=\"stylesheet\" href=\"/admin/assets/admin.css\"><script defer src=\"/admin/assets/admin.js\"></script></head><body><main id=\"admin-content\"><p class=\"eyebrow\">Build Cache · Snapshot service</p><h1>Target snapshots</h1><p class=\"muted\">Read-only current snapshot state. Promotion is controlled by the VPS builder flow.</p><div class=\"card\"><table><thead><tr><th>Rust target</th><th>State</th><th>Vapor version</th><th>Vapor.lock SHA-256</th><th>Toolchain lock SHA-256</th><th>Archive SHA-256</th><th>Bytes</th><th>Last promotion</th><th>Promoted (Unix)</th></tr></thead><tbody>{rows}</tbody></table><p class=\"muted\">Only the exact current client and lock state is accepted. Snapshot bytes are compiler output only.</p></div></main></body></html>");
+    let html = format!("<p class=\"eyebrow\">Build Cache · Snapshot service</p><h1>Target snapshots</h1><p class=\"muted\">Read-only current snapshot state. Promotion is controlled by the VPS builder flow.</p><div class=\"card\"><table><thead><tr><th>Rust target</th><th>State</th><th>Vapor version</th><th>Vapor.lock SHA-256</th><th>Toolchain lock SHA-256</th><th>Archive SHA-256</th><th>Bytes</th><th>Last promotion</th><th>Promoted (Unix)</th></tr></thead><tbody>{rows}</tbody></table><p class=\"muted\">Only the exact current client and lock state is accepted. Snapshot bytes are compiler output only.</p></div>");
     private_response(StatusCode::OK, &html)
 }
 
@@ -227,7 +227,7 @@ fn private_response(status: StatusCode, body: &str) -> Response {
     let mut response = (status, body.to_owned()).into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
+        HeaderValue::from_static("application/vnd.vapor.admin-page.v1+html; charset=utf-8"),
     );
     response
         .headers_mut()
@@ -310,10 +310,17 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert_eq!(response.headers()["cache-control"], "private, no-store");
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/vnd.vapor.admin-page.v1+html; charset=utf-8"
+        );
         let html = axum::body::to_bytes(response.into_body(), 16 * 1024)
             .await
             .unwrap();
         let html = String::from_utf8(html.to_vec()).unwrap();
+        assert!(!html.contains("<!doctype html>"));
+        assert!(!html.contains("<body>"));
+        assert!(html.starts_with("<p class=\"eyebrow\">Build Cache"));
         assert!(html.contains("x86_64-unknown-linux-gnu"));
         assert!(html.contains("x86_64-pc-windows-gnullvm"));
         assert!(html.contains(&vapor_lock));
@@ -502,5 +509,42 @@ mod tests {
             response.status(),
             axum::http::StatusCode::METHOD_NOT_ALLOWED
         );
+    }
+
+    #[tokio::test]
+    async fn build_cache_auth_errors_use_the_shared_page_fragment_contract() {
+        let config = BuildCacheConfig::new(
+            std::env::temp_dir().join(format!("vapor-admin-unauth-test-{}", std::process::id())),
+            "0.5.0".to_owned(),
+            "a".repeat(64),
+            "b".repeat(64),
+            "test-recipe".to_owned(),
+            "test-key".to_owned(),
+            [1_u8; 32],
+            HashMap::from([
+                ("x86_64-unknown-linux-gnu".to_owned(), "c".repeat(64)),
+                ("x86_64-pc-windows-gnullvm".to_owned(), "d".repeat(64)),
+            ]),
+            "e".repeat(64),
+        );
+        let response = admin_router(config)
+            .oneshot(
+                axum::http::Request::get("/admin/build-cache")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/vnd.vapor.admin-page.v1+html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.starts_with("Sign in to view Build Cache."));
+        assert!(!body.contains("<html"));
     }
 }
